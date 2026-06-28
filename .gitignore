@@ -2,6 +2,7 @@ release/ATP_Stock_Report/
 release/*.zip
 release/publish/
 release/.patch_stage/
+release/.cache/
 __pycache__/
 *.pyc
 .pytest_cache/
