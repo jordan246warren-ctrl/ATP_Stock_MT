@@ -1,0 +1,35 @@
+---
+description: Rules for the Streamlit UI, table styling, and print formatting for the ATP engine.
+globs: *.py
+---
+
+# Output & UI Architecture (Streamlit)
+
+## 1. Tech Stack & Environment
+* The UI must be built using `Streamlit` and `Pandas`.
+* It is a local web app. No external API calls or cloud hosting configurations should be added.
+
+## 2. Age Buckets (Updated)
+The exact age buckets for columns must be:
+* `0-4`
+* `4-6`
+* `6-9`
+* `9+`
+(Do not use labels like "Fresh" or "Clearance", just the numbers).
+
+## 3. Display Logic & Sorting
+* **Sorting:** Groups with stock should be displayed in the order they
+appear in Groups.csv after zero-stock groups are removed.
+* **Filtering:** If a Selling Group has a Total Physical Stock of `0` across all buckets, OMIT the entire row. Do not display empty groups.
+
+## 4. Visual Styling (The White Table)
+Use Pandas Styler (`df.style`) to format the dataframe in Streamlit:
+* The base table must have a white background with black text.
+* The leftmost column must contain the Selling Group names.
+* **Zero-Value Greying:** If a cell in an age bucket contains the number `0`, the text color of that specific cell must be light grey (e.g., `#d3d3d3` or similar) so it fades into the background, highlighting the actual stock values.
+
+## 5. Print Formatting
+Inject custom CSS (`st.markdown("<style>...</style>", unsafe_allow_html=True)`) to optimize the page for printing:
+* Hide the default Streamlit main menu, header, and footer.
+* Apply an `@media print` block to force portrait orientation (`size: portrait;`).
+* Paginate the table across A4 portrait pages without clipping rows; repeat the header on each page and avoid splitting rows across page breaks.

@@ -1,0 +1,31 @@
+---
+description: Rules for parsing physical Stock on Hand (SOH) and creating the aggregated inventory state.
+globs: phase1*.py, soh*.xls*
+---
+
+# Phase 1: SOH Ingestion & Bucketing
+
+## Objective
+Read the physical stock file (`---.xls`), map individual items to their Selling Group, and aggregate them by Age Bucket.
+
+## Execution Steps
+1. **Load the Alias Map:** Read the Excel/CSV file containing the Product Codes (Col A) and their corresponding Selling Groups (Col C).
+2. **Read `soh.xls`:** Iterate through the scanned physical stock. Every row has a quantity of 1.
+3. **Map & Aggregate:** 
+   * Look up the Product Code (Col A) in the Alias Map to find its Selling Group.
+   * Read the "Days Old" decimal (Col E) and assign it to the correct Age Bucket (0-4, 4-6, 6-9, 9+).
+   * Increment the counter for that Selling Group and Age Bucket.
+4. **Data Output:** The output of this phase MUST be a nested dictionary/JSON structure. Example:
+```json
+   {
+     "Sides A0-1": {
+       "total_stock": 25,
+       "buckets": {"0-4": 15, "4-6": 10, "6-9": 0, "9+": 0}
+     }
+   }
+Every Selling Group must contain all four bucket keys,
+even when the value is zero.
+
+Constraints:
+- Drop any rows that are entirely blank.
+- If a Product Code in the .xls is missing from the Alias Map, log it to an "Unmapped Items" list and exclude it from the main aggregation. Do not guess the group.

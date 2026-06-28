@@ -1,0 +1,220 @@
+---
+description: Rules for parsing Abaserve orders files and applying customer-tier ATP deductions.
+globs: phase2*.py, orders*.py, orders*.xls*
+---
+
+# Phase 2: Order Deductions & ATP
+
+## Objective
+
+Subtract open order quantities from Phase 1 physical stock (direct counts only) at **Selling Group + age bucket** level to produce **Available to Promise (ATP)**. Bracket rollups are computed **after** deductions so parent-cut availability stays in sync.
+
+## Execution Pipeline (strict order)
+
+1. `parse_soh_counts(soh_file)` → `counts` dict + SOH `unmapped`
+2. `parse_orders(orders_file)` → list of order lines (optional — skip if no upload)
+3. `apply_deductions(counts, order_lines, code_to_group)` → mutates `counts` in place
+4. `build_inventory_df(counts, ordered_groups)` → rollups + display DataFrame
+5. Render in `app.py`
+
+Deductions MUST run **before** `compute_rollups()`. Never deduct from bracket display values.
+
+---
+
+## Orders File Format (Abaserve `.xls`)
+
+Hierarchical dispatch report. **No column headers.** Seven columns (A–G). Single sheet.
+
+### Row types
+
+| Type | How to detect | Action |
+|------|---------------|--------|
+| Blank | All cells empty | Skip |
+| Species banner | Single label in A (`BEEF`, `SHEEP`, `PORK`, …) | Skip; reset group context |
+| Group header | Short code + title in A–B (`BA`, `BEEF A GRADE`) | Skip; set group context |
+| Product summary | Product code in A, description in B, aggregated qty/weight/value in C–E | Set `current_product = A` |
+| Customer order line | 5–6 digit order ID in A, customer in B, **date in D**, **qty in E** | **Extract** |
+| Bulk kg line | `D == 100.0`, no F/G | Skip |
+| Subtotal | A starts with `SUB TOTAL:` | Skip |
+| Grand total | A is `GRAND TOTAL` | Skip |
+| Footer | e.g. `Abaserve R29107` | Skip |
+
+### Customer order line columns (Format A)
+
+| Col | Field |
+|-----|-------|
+| A | Order ID (not used for deduction) |
+| B | **Customer name** (drives age-bucket tier) |
+| C | Notes (`CARCASS`, `BACK ORDER`, …) — **ignored** |
+| D | Dispatch date — **ignored** |
+| E | **Quantity** (units to deduct) |
+| F | Weight — **ignored** |
+| G | Price — **ignored** |
+
+### Product code inheritance
+
+Order lines do **not** carry the product code. Track `current_product` from the nearest preceding **product summary** row and attach it to each order line.
+
+### Example
+
+```
+BA2F | BEEF A2 FORE QUARTER | 6 | 418.14 | 31695.01          ← current_product = BA2F
+382172 | Boxer Thembalethu Square - X481 | | 2026-06-18 | 3  ← qty=3, customer=Boxer…
+382174 | Boxer KwaNokuthula Crossing - X476 | | 2026-06-18 | 3
+```
+
+### Skip conditions
+
+- Quantity `0`
+- Product code not in `Groups.csv` → add to `unmapped_orders`, do not guess
+- Pork, deboned, offal, and other unmapped categories in sample files
+
+---
+
+## Fields Used
+
+Only three fields matter per order line:
+
+1. **Product code** (inherited from summary row) → mapped to Selling Group via `Groups.csv`
+2. **Customer name** (column B) → customer tier → bucket waterfall
+3. **Quantity** (column E) → units to deduct
+
+---
+
+## Customer Tiers
+
+Priority order (first match wins):
+
+```python
+def customer_tier(name: str) -> Literal["boxer", "shoprite", "default"]:
+    n = name.strip().lower()
+    if n.startswith("boxer"):
+        return "boxer"
+    if n.startswith("shoprite"):
+        return "shoprite"
+    return "default"  # includes SPAR and all other customers
+```
+
+**Verified against sample `orders.xls`:** all 13 Shoprite order lines use customer names starting with `SHOPRITE` (case-insensitive). No exceptions.
+
+### Bucket waterfalls
+
+**9+ is never used for order deductions.** Buckets `4-6` and `6-9` never go below 0 during deduction. Unmet demand after the tier waterfall is absorbed as a negative value on the `0-4` bucket.
+
+| Tier | Bucket order | Notes |
+|------|--------------|-------|
+| boxer | `0-4` only | No spill to other buckets |
+| shoprite | `4-6` → `0-4` | No 6-9, no 9+ |
+| default | `6-9` → `4-6` → `0-4` | SPAR, Pick n Pay, etc. |
+
+### Shortfall handling
+
+After the tier waterfall is exhausted, any remaining quantity is subtracted from the **0-4** bucket (may go **negative**). Other bucket cells stay floored at 0. Negative `0-4` values render in red (existing `_cell_style` in `app.py`).
+
+---
+
+## Pistola / FQ SO / FQ SQC Fallback
+
+Orders mapped to `Pistola HQ …`, `Pistola R&L …`, `FQ SO …`, or `FQ SQC …` groups:
+
+1. **Try the mapped group first** — deduct from its direct bucket counts when stock exists.
+2. **Fallback only when that group's direct total is 0** — deduct from the **exact parallel** normal Selling Group:
+   - `Pistola HQ A1` → `HQ A0-1`
+   - `Pistola R&L AB3-6` → `R&L AB3-6`
+   - `FQ SO AB2` → `FQ AB2`
+   - `FQ SQC B/C3-6` → `FQ B/C3-6`
+
+Resolve fallback via prefix swap validated against `Groups.csv` / `ordered_groups` (same grade band as the alias map entry for that product code).
+
+---
+
+## Deduction Algorithm
+
+Per aggregated `(selling_group, customer_tier, qty)`:
+
+```
+remaining = qty
+target = resolve_deduction_group(selling_group, counts)  # pistola/fq-so fallback
+for bucket in tier_bucket_sequence(tier):
+    take = min(remaining, counts[target][bucket])
+    counts[target][bucket] -= take
+    remaining -= take
+    if remaining == 0: break
+if remaining > 0:
+    # Apply to 0-4 bucket — may go negative
+    counts[target]["0-4"] -= remaining
+```
+
+- Deduct from **direct (physical) counts** only.
+- Aggregate multiple order lines for the same product + tier before deducting.
+- Bull, Lamb, Mutton, Rams: same tier logic; no rollup brackets (already excluded in Phase 1 rollups).
+
+---
+
+## Module Responsibilities
+
+| Function | Module | Responsibility |
+|----------|--------|----------------|
+| `parse_soh_counts(soh_file)` | `parser.py` | SOH → `counts` dict + `unmapped` |
+| `build_inventory_df(counts, ordered_groups, orders_applied=False)` | `parser.py` | rollups + visible df + `missing_rollup_targets` |
+| `process_soh(soh_file)` | `parser.py` | backward-compatible wrapper (no orders) |
+| `process_inventory(soh_file, orders_file=None)` | `parser.py` | full orchestrator |
+| `parse_orders(orders_file)` | `orders.py` | Abaserve hierarchy → `OrderLine` list |
+| `apply_deductions(counts, order_lines, code_to_group)` | `orders.py` | mutates counts in place |
+| `customer_tier(name)` | `orders.py` | tier classification |
+| `resolve_deduction_group(group, counts, ordered_groups)` | `orders.py` | pistola / FQ SO / FQ SQC fallback |
+
+`orders.py` MUST NOT import Streamlit.
+
+---
+
+## UI Contract (`app.py`)
+
+- Second `st.file_uploader` for orders (`.xls` / `.xlsx`). Optional — no upload = Phase 1 behavior.
+- Call `process_inventory(soh, orders)` when orders uploaded.
+- **Total Physical Stock** column shown only when no orders are loaded. When orders are uploaded, hide the total column and show age buckets only.
+- No TOTAL footer row.
+- Warnings: SOH `unmapped`, `unmapped_orders`, `missing_rollup_targets`.
+- **Row visibility when orders loaded:** show any row where direct total ≠ 0 **or** incoming rollup ≠ 0 (includes negative 0-4 shortfall rows and positive stock rows). Hide only rows that are zero everywhere.
+
+---
+
+## Groups.csv Scope
+
+Only product codes present in `Groups.csv` participate. Orders for pork, deboned, offal, and other unmapped codes are skipped with a warning.
+
+---
+
+## Non-Goals (deferred)
+
+- Order notes (`CARCASS`, `BACK ORDER`) — no effect on deduction
+- Weight, price, dispatch date — ignored
+- Separate Physical / Orders / ATP columns — single total column for physical stock only; hidden after deduction
+- 9+ bucket for order waterfall
+
+---
+
+## Test Fixtures (future)
+
+| Fixture | Purpose |
+|---------|---------|
+| `tests/fixtures/orders_sample.xls` | Client sample (or trimmed copy) |
+| `tests/fixtures/orders_minimal.xls` | Synthetic: 1 product summary + Boxer / Shoprite / SPAR order lines |
+
+### Synthetic test cases
+
+1. **Boxer:** 3 in 0-4, order qty 5 → 0-4 = **-2**
+2. **Shoprite:** stock in 4-6 and 0-4 → drains 4-6 then 0-4 only
+3. **SPAR (default):** drains 6-9 → 4-6 → 0-4 only
+4. **Sides order:** direct Sides reduced; rollups recompute lower brackets on FQ/HQ/R&L/Buttocks
+5. **Pistola HQ:** 0 pistola stock → deducts from parallel `HQ …` group
+
+---
+
+## Resolved Decisions
+
+- SPAR is **default tier**, not special
+- Shoprite: `startswith "shoprite"` (case-insensitive), verified on sample file
+- Pistola: try mapped group first; fallback when direct total is **0**
+- Total column hidden when orders loaded; negative shortfall shown on **0-4** bucket
+- Show rows with negative **or** positive values when orders loaded

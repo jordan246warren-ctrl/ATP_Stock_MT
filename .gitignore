@@ -1,0 +1,15 @@
+release/ATP_Stock_Report/
+release/*.zip
+release/publish/
+release/.patch_stage/
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+venv/
+
+# Scratch / debug artifacts
+debug-*.log
+_analysis_tmp.py
+_analyze_orders*.py
+_orders_analysis.json
