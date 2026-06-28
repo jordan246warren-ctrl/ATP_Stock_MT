@@ -3,6 +3,7 @@ release/*.zip
 release/publish/
 release/.patch_stage/
 release/.cache/
+.cursor/
 __pycache__/
 *.pyc
 .pytest_cache/
